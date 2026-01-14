@@ -46,7 +46,7 @@ SHUNT_OHMS = float(os.environ.get("SHUNT_OHMS", "165.0"))
 FLOW_MIN_SCCM = float(os.environ.get("FLOW_MIN_SCCM", os.environ.get("FLOW_MIN_M3H", "0.0")))
 FLOW_MAX_SCCM = float(os.environ.get("FLOW_MAX_SCCM", os.environ.get("FLOW_MAX_M3H", "50.0")))
 CO2_DENSITY_G_M3 = float(os.environ.get("CO2_DENSITY_G_M3", "1964.0"))
-BROTH_VOLUME_L = float(os.environ.get("BROTH_VOLUME_L", "1000.0"))
+BROTH_VOLUME_L = float(os.environ.get("BROTH_VOLUME_L", "5.0"))
 
 SAMPLE_PERIOD_SEC_ENV = os.environ.get("SAMPLE_PERIOD_SEC", "").strip()
 SAMPLE_PERIOD_SEC = parse_int(SAMPLE_PERIOD_SEC_ENV, 0) if SAMPLE_PERIOD_SEC_ENV else None
@@ -1623,7 +1623,7 @@ class App(ctk.CTk):
         stats.grid_columnconfigure(1, weight=1)
 
         flow_var = tk.StringVar(value="0.00 SCCM")
-        rate_var = tk.StringVar(value="0.00 g/L*h")
+        rate_var = tk.StringVar(value="0.0000 g/L*h")
         current_var = tk.StringVar(value="0.00 mA")
         voltage_var = tk.StringVar(value="0.000 V")
         status_var = tk.StringVar(value="Esperando...")
@@ -1733,14 +1733,14 @@ class App(ctk.CTk):
             samples = self.flow_samples.get(fermenter, [])
             if not samples:
                 flow_var.set("0.00 SCCM")
-                rate_var.set("0.00 g/L*h")
+                rate_var.set("0.0000 g/L*h")
                 current_var.set("0.00 mA")
                 voltage_var.set("0.000 V")
                 status_var.set("Esperando...")
                 return
             _, flow, current_ma, voltage, status = samples[-1]
             flow_var.set(f"{flow:0.2f} SCCM")
-            rate_var.set(f"{flow_to_rate_g_l_h(flow):0.2f} g/L*h")
+            rate_var.set(f"{flow_to_rate_g_l_h(flow):0.4f} g/L*h")
             current_var.set(f"{current_ma:0.2f} mA")
             voltage_var.set(f"{voltage:0.3f} V")
             status_var.set(status)
