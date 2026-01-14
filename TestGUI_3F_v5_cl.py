@@ -309,13 +309,22 @@ class ADS1115Reader:
 # ===== LED widget =====
 class Led:
     def __init__(self, parent, size=20):
+        bg = None
+        for key in ("fg_color", "background", "bg"):
+            try:
+                bg = parent.cget(key)
+                break
+            except Exception:
+                continue
+        if bg is None:
+            bg = "#111827"
         self.canvas = tk.Canvas(
             parent,
             width=size,
             height=size,
             highlightthickness=0,
             bd=0,
-            bg=parent.cget("fg_color") if hasattr(parent, "cget") else parent.cget("background"),
+            bg=bg,
         )
         r = 2
         self.oval = self.canvas.create_oval(r, r, size - r, size - r, fill="red", outline="#111")
@@ -1360,6 +1369,12 @@ class App(ctk.CTk):
         self.flow_samples = {}
         self.flow_next_sample = {}
         self.flow_sample_period = {}
+        self.co2_csv_dir = {}
+        self.co2_csv_name = {}
+        self.co2_csv_running = {}
+        self.co2_csv_paused = {}
+        self.co2_csv_last_export_ok = {}
+        self._co2_csv_leds = {}
         for name in ("F1", "F2", "F3"):
             addr_env = os.environ.get(f"ADS1115_ADDR_{name}", "").strip()
             ch_env = os.environ.get(f"ADS1115_CH_{name}", "").strip()
@@ -1372,10 +1387,16 @@ class App(ctk.CTk):
             self.flow_samples[name] = []
             self.flow_next_sample[name] = None
             if SAMPLE_PERIOD_SEC is None:
-                period = 10 if reader.sim else 600
+                period = 1 if reader.sim else 600
             else:
                 period = SAMPLE_PERIOD_SEC
             self.flow_sample_period[name] = period
+            self.co2_csv_dir[name] = tk.StringVar(value=os.path.abspath("./Proceso"))
+            self.co2_csv_name[name] = tk.StringVar(value=f"{name}_co2.csv")
+            self.co2_csv_running[name] = False
+            self.co2_csv_paused[name] = False
+            self.co2_csv_last_export_ok[name] = False
+            os.makedirs(self.co2_csv_dir[name].get(), exist_ok=True)
         self._flow_plot_windows = {}
 
         # ---------- LOGO CII ----------
@@ -1549,6 +1570,93 @@ class App(ctk.CTk):
                 data[ferm]["nut"].append(nut)
         return data
 
+    def _co2_csv_path(self, fermenter):
+        name = self.co2_csv_name[fermenter].get().strip() or f"{fermenter}_co2.csv"
+        if not name.lower().endswith(".csv"):
+            name += ".csv"
+        return os.path.join(self.co2_csv_dir[fermenter].get(), name)
+
+    def _co2_csv_state_led(self, fermenter, color):
+        led = self._co2_csv_leds.get(fermenter)
+        if led is not None:
+            led.set_color(color)
+
+    def co2_pick_dir(self, fermenter):
+        d = filedialog.askdirectory(title="Elegir carpeta de trabajo CSV CO2")
+        _restore_focus(self)
+        if d:
+            self.co2_csv_dir[fermenter].set(d)
+            os.makedirs(d, exist_ok=True)
+
+    def co2_csv_start(self, fermenter):
+        self.co2_csv_running[fermenter] = True
+        self.co2_csv_paused[fermenter] = False
+        self.co2_csv_last_export_ok[fermenter] = False
+        self._co2_csv_state_led(fermenter, "#22c55e")
+
+    def co2_csv_pause(self, fermenter):
+        self.co2_csv_running[fermenter] = False
+        self.co2_csv_paused[fermenter] = True
+        self._co2_csv_state_led(fermenter, "#eab308")
+
+    def co2_csv_export(self, fermenter):
+        if self.co2_csv_running[fermenter]:
+            messagebox.showerror("Exportar", "Detén o pausa el CSV antes de exportar.")
+            return
+        src = self._co2_csv_path(fermenter)
+        if not os.path.exists(src):
+            messagebox.showerror("Exportar", f"No existe {src}")
+            return
+        dst_dir = filedialog.askdirectory(title="Seleccionar carpeta de destino")
+        _restore_focus(self)
+        if not dst_dir:
+            return
+        try:
+            dst = os.path.join(dst_dir, os.path.basename(src))
+            with open(src, "r", encoding="utf-8") as fsrc, open(dst, "w", encoding="utf-8", newline="") as fdst:
+                fdst.write(fsrc.read())
+            self.co2_csv_last_export_ok[fermenter] = True
+            self._co2_csv_state_led(fermenter, "#3b82f6")
+            messagebox.showinfo("Exportar", f"Archivo exportado a:\n{dst}")
+        except Exception as e:
+            messagebox.showerror("Exportar", f"No se pudo exportar.\n{e}")
+
+    def co2_csv_restart(self, fermenter):
+        self.co2_csv_running[fermenter] = False
+        self.co2_csv_paused[fermenter] = False
+        path = self._co2_csv_path(fermenter)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            self._co2_csv_state_led(fermenter, "#ef4444")
+            messagebox.showinfo("CSV CO2", f"Archivo reiniciado:\n{path}")
+        except Exception as e:
+            messagebox.showerror("CSV CO2", f"No se pudo reiniciar.\n{e}")
+
+    def _co2_csv_write_row(self, fermenter, ts, flow, current_ma, voltage, status):
+        if not self.co2_csv_running.get(fermenter, False):
+            return
+        row = {
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "fermentador": fermenter,
+            "flow_sccm": f"{flow:.4f}",
+            "rate_g_l_h": f"{flow_to_rate_g_l_h(flow):.6f}",
+            "current_ma": f"{current_ma:.3f}",
+            "voltage_v": f"{voltage:.4f}",
+            "status": status,
+        }
+        ipath = self._co2_csv_path(fermenter)
+        header = not os.path.exists(ipath)
+        try:
+            os.makedirs(os.path.dirname(ipath), exist_ok=True)
+            with open(ipath, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if header:
+                    w.writeheader()
+                w.writerow(row)
+        except Exception as e:
+            messagebox.showerror("CSV CO2", f"No se pudo escribir en {ipath}\n{e}")
+
     def _flow_take_sample(self, fermenter, ts=None):
         reader = self.flow_readers.get(fermenter)
         if reader is None:
@@ -1575,6 +1683,7 @@ class App(ctk.CTk):
         samples.append((ts, flow, current_ma, voltage, status))
         cutoff = ts - dt.timedelta(hours=MAX_FLOW_HISTORY_HOURS)
         self.flow_samples[fermenter] = [row for row in samples if row[0] >= cutoff]
+        self._co2_csv_write_row(fermenter, ts, flow, current_ma, voltage, status)
         self.flow_next_sample[fermenter] = ts + dt.timedelta(seconds=self.flow_sample_period[fermenter])
 
     def _flow_tick(self):
@@ -1667,6 +1776,60 @@ class App(ctk.CTk):
             ("3 semanas", 24 * 21),
         ]:
             ttk.Button(control, text=label, command=lambda h=hours: set_window(h)).pack(side="left", padx=2)
+
+        csv_box = ttk.Frame(top)
+        csv_box.pack(fill="x", padx=8, pady=(0, 6))
+        csv_box.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(csv_box, text="CSV CO2", font=("Segoe UI", 12, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w"
+        )
+
+        ttk.Label(csv_box, text="Carpeta:").grid(row=1, column=0, sticky="e", padx=(0, 4), pady=2)
+        ttk.Entry(csv_box, textvariable=self.co2_csv_dir[fermenter]).grid(
+            row=1, column=1, sticky="ew", pady=2
+        )
+        ttk.Button(csv_box, text="...", width=4, command=lambda: self.co2_pick_dir(fermenter)).grid(
+            row=1, column=2, sticky="w", pady=2
+        )
+
+        ttk.Label(csv_box, text="Archivo:").grid(row=2, column=0, sticky="e", padx=(0, 4), pady=2)
+        ttk.Entry(csv_box, textvariable=self.co2_csv_name[fermenter]).grid(
+            row=2, column=1, sticky="ew", pady=2
+        )
+
+        btn_row = ttk.Frame(csv_box)
+        btn_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 4))
+        for i in range(4):
+            btn_row.grid_columnconfigure(i, weight=1)
+
+        ttk.Button(btn_row, text="Inicio/Reanudar", command=lambda: self.co2_csv_start(fermenter)).grid(
+            row=0, column=0, padx=2, sticky="ew"
+        )
+        ttk.Button(btn_row, text="Pausar/Detener", command=lambda: self.co2_csv_pause(fermenter)).grid(
+            row=0, column=1, padx=2, sticky="ew"
+        )
+        ttk.Button(btn_row, text="Exportar CSV", command=lambda: self.co2_csv_export(fermenter)).grid(
+            row=0, column=2, padx=2, sticky="ew"
+        )
+        ttk.Button(btn_row, text="Borrar/Reiniciar", command=lambda: self.co2_csv_restart(fermenter)).grid(
+            row=0, column=3, padx=2, sticky="ew"
+        )
+
+        state_row = ttk.Frame(csv_box)
+        state_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        ttk.Label(state_row, text="Estado:").pack(side="left")
+        led = Led(state_row)
+        led.widget().pack(side="left", padx=6)
+        self._co2_csv_leds[fermenter] = led
+        if self.co2_csv_running.get(fermenter):
+            led.set_color("#22c55e")
+        elif self.co2_csv_paused.get(fermenter):
+            led.set_color("#eab308")
+        elif self.co2_csv_last_export_ok.get(fermenter):
+            led.set_color("#3b82f6")
+        else:
+            led.set_color("#ef4444")
 
         fig, (ax_flow, ax_rate) = plt.subplots(
             2,
@@ -1779,6 +1942,7 @@ class App(ctk.CTk):
                 self._plot_windows.remove(top)
             if self._flow_plot_windows.get(fermenter) is top:
                 self._flow_plot_windows.pop(fermenter, None)
+            self._co2_csv_leds.pop(fermenter, None)
             top.destroy()
 
         top.protocol("WM_DELETE_WINDOW", on_close_plot)
