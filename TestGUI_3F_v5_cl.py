@@ -39,10 +39,10 @@ def parse_int(value: str, default: int) -> int:
 
 
 ADS1115_ADDR = parse_int(os.environ.get("ADS1115_ADDR", "0x48"), 0x48)
-ADS1115_CH = parse_int(os.environ.get("ADS1115_CH", "0"), 0)
+ADS1115_CH = parse_int(os.environ.get("ADS1115_CH", "1"), 1)
 ADS1115_GAIN = parse_int(os.environ.get("ADS1115_GAIN", "1"), 1)
 
-SHUNT_OHMS = float(os.environ.get("SHUNT_OHMS", "165.0"))
+SHUNT_OHMS = float(os.environ.get("SHUNT_OHMS", "147.0"))
 FLOW_MIN_SCCM = float(os.environ.get("FLOW_MIN_SCCM", os.environ.get("FLOW_MIN_M3H", "0.0")))
 FLOW_MAX_SCCM = float(os.environ.get("FLOW_MAX_SCCM", os.environ.get("FLOW_MAX_M3H", "50.0")))
 CO2_DENSITY_G_M3 = float(os.environ.get("CO2_DENSITY_G_M3", "1964.0"))
@@ -139,6 +139,8 @@ class Hardware:
     def __init__(self):
         self.sim = SIMULADOR
         self.sim_reason = "Forzado por variable de entorno" if self.sim else ""
+        self.sim_gpio = self.sim
+        self.sim_gpio_reason = "Forzado por variable de entorno" if self.sim else ""
         self.gpio = None
         self.pwms = {}
         self._last_temp_error = False
@@ -151,22 +153,35 @@ class Hardware:
                 self.gpio = GPIO
                 GPIO.setmode(GPIO.BCM)
                 GPIO.setwarnings(False)
-
-                # Buscamos los DS18B20, pero NO forzamos simulador si no hay
-                self.ds_devices = sorted(glob.glob("/sys/bus/w1/devices/28-*"))
-                if len(self.ds_devices) < 1:
-                    print("[HW] Advertencia: no se encontraron DS18B20, "
-                          "se usar� 20�C de respaldo para la temperatura.")
             except Exception as e:
-                # Aqu� s� caemos a simulador: problema real con GPIO o el sistema
-                self.sim = True
-                self.sim_reason = f"Fallback a simulador: {e}"
+                # Solo desactivamos GPIO; no afecta ADS1115 ni DS18B20.
+                self.sim_gpio = True
+                self.sim_gpio_reason = f"GPIO fallback: {e}"
                 self.gpio = None
+
+            # Buscamos los DS18B20, pero NO forzamos simulador si no hay
+            self.ds_devices = sorted(glob.glob("/sys/bus/w1/devices/28-*"))
+            if len(self.ds_devices) < 1:
+                print("[HW] Advertencia: no se encontraron DS18B20, "
+                      "se usar� 20�C de respaldo para la temperatura.")
 
         if self.sim:
             print(f"[HW] Modo simulador activo. {self.sim_reason}")
         else:
+            if self.sim_gpio:
+                print(f"[HW] GPIO en simulador. {self.sim_gpio_reason}")
+            else:
+                print("[HW] GPIO activo.")
             print("[HW] Modo hardware activo. Sensores detectados:", self.ds_devices)
+
+    def _gpio_fallback(self, exc: Exception):
+        if self.sim_gpio:
+            return
+        self.sim_gpio = True
+        self.sim_gpio_reason = f"GPIO fallback: {exc}"
+        self.gpio = None
+        self.pwms = {}
+        print(f"[HW] {self.sim_gpio_reason}")
 
     # --- DS18B20 ---
     def read_temp_ds18b20(self, index: int) -> float:
@@ -193,52 +208,70 @@ class Hardware:
 
     # --- Relés ---
     def setup_relay(self, pin: int):
-        if self.sim or not self.gpio:
+        if self.sim or self.sim_gpio or not self.gpio:
             return
-        self.gpio.setup(pin, self.gpio.OUT)
-        self.gpio.output(pin, self.gpio.HIGH)
+        try:
+            self.gpio.setup(pin, self.gpio.OUT)
+            self.gpio.output(pin, self.gpio.HIGH)
+        except Exception as e:
+            self._gpio_fallback(e)
 
     def relay_on(self, pin: int):
-        if self.sim or not self.gpio:
+        if self.sim or self.sim_gpio or not self.gpio:
             return
-        self.gpio.output(pin, self.gpio.LOW)
+        try:
+            self.gpio.output(pin, self.gpio.LOW)
+        except Exception as e:
+            self._gpio_fallback(e)
 
     def relay_off(self, pin: int):
-        if self.sim or not self.gpio:
+        if self.sim or self.sim_gpio or not self.gpio:
             return
-        self.gpio.output(pin, self.gpio.HIGH)
+        try:
+            self.gpio.output(pin, self.gpio.HIGH)
+        except Exception as e:
+            self._gpio_fallback(e)
 
     # --- Stepper ---
     def setup_stepper(self, name: str, pul: int, direction: int, freq: float):
-        if self.sim or not self.gpio:
+        if self.sim or self.sim_gpio or not self.gpio:
             return
-        GPIO = self.gpio
-        GPIO.setup(direction, GPIO.OUT)
-        GPIO.output(direction, GPIO.LOW)
-        GPIO.setup(pul, GPIO.OUT)
-        pwm = GPIO.PWM(pul, max(1, int(freq)))
-        self.pwms[name] = {"pwm": pwm, "dir": direction, "pul": pul}
+        try:
+            GPIO = self.gpio
+            GPIO.setup(direction, GPIO.OUT)
+            GPIO.output(direction, GPIO.LOW)
+            GPIO.setup(pul, GPIO.OUT)
+            pwm = GPIO.PWM(pul, max(1, int(freq)))
+            self.pwms[name] = {"pwm": pwm, "dir": direction, "pul": pul}
+        except Exception as e:
+            self._gpio_fallback(e)
 
     def start_stepper(self, name: str, freq: float):
-        if self.sim or not self.gpio:
+        if self.sim or self.sim_gpio or not self.gpio:
             return
         if name not in self.pwms:
             return
-        pwm = self.pwms[name]["pwm"]
-        pwm.ChangeFrequency(max(1, int(freq)))
-        pwm.start(1)
+        try:
+            pwm = self.pwms[name]["pwm"]
+            pwm.ChangeFrequency(max(1, int(freq)))
+            pwm.start(1)
+        except Exception as e:
+            self._gpio_fallback(e)
 
     def stop_stepper(self, name: str):
-        if self.sim or not self.gpio:
+        if self.sim or self.sim_gpio or not self.gpio:
             return
         if name not in self.pwms:
             return
-        pwm = self.pwms[name]["pwm"]
-        pwm.stop()
-        self.gpio.output(self.pwms[name]["dir"], self.gpio.LOW)
+        try:
+            pwm = self.pwms[name]["pwm"]
+            pwm.stop()
+            self.gpio.output(self.pwms[name]["dir"], self.gpio.LOW)
+        except Exception as e:
+            self._gpio_fallback(e)
 
     def cleanup(self):
-        if self.sim or not self.gpio:
+        if self.sim or self.sim_gpio or not self.gpio:
             return
         try:
             self.gpio.cleanup()
@@ -274,14 +307,27 @@ class ADS1115Reader:
             self.sim_reason = f"Fallback a simulador: {exc}"
             return
 
-        if _ADS_I2C is None:
-            _ADS_I2C = busio.I2C(board.SCL, board.SDA)
-        i2c = _ADS_I2C
-        ads = ADS.ADS1115(i2c, address=self.address)
-        ads.gain = self.gain
-        ch_map = [ADS.P0, ADS.P1, ADS.P2, ADS.P3]
-        self._ads = ads
-        self._chan = AnalogIn(ads, ch_map[self.channel])
+        try:
+            if _ADS_I2C is None:
+                _ADS_I2C = busio.I2C(board.SCL, board.SDA)
+            i2c = _ADS_I2C
+            ads = ADS.ADS1115(i2c, address=self.address)
+            ads.gain = self.gain
+            try:
+                ch_map = [ADS.P0, ADS.P1, ADS.P2, ADS.P3]
+            except AttributeError:
+                try:
+                    from adafruit_ads1x15.ads1x15 import Pin  # type: ignore
+                    ch_map = [Pin.A0, Pin.A1, Pin.A2, Pin.A3]
+                except Exception:
+                    ch_map = [0, 1, 2, 3]
+            self._ads = ads
+            self._chan = AnalogIn(ads, ch_map[self.channel])
+        except Exception as exc:
+            self.sim = True
+            self.sim_reason = f"Fallback a simulador: {exc}"
+            self._ads = None
+            self._chan = None
 
     def read_voltage(self) -> float:
         if self.sim or not self._chan:
@@ -304,6 +350,17 @@ class ADS1115Reader:
             current_ma = max(4.0, min(20.0, current_ma))
             return (current_ma / 1000.0) * SHUNT_OHMS
         return float(self._chan.voltage)
+
+    def close(self):
+        global _ADS_I2C
+        self._chan = None
+        self._ads = None
+        if _ADS_I2C is not None:
+            try:
+                _ADS_I2C.deinit()
+            except Exception:
+                pass
+            _ADS_I2C = None
 
 
 # ===== LED widget =====
@@ -1375,19 +1432,21 @@ class App(ctk.CTk):
         self.co2_csv_paused = {}
         self.co2_csv_last_export_ok = {}
         self._co2_csv_leds = {}
+        default_channels = {"F1": 1, "F2": 2, "F3": 3}
         for name in ("F1", "F2", "F3"):
             addr_env = os.environ.get(f"ADS1115_ADDR_{name}", "").strip()
             ch_env = os.environ.get(f"ADS1115_CH_{name}", "").strip()
             gain_env = os.environ.get(f"ADS1115_GAIN_{name}", "").strip()
             addr = parse_int(addr_env, ADS1115_ADDR) if addr_env else ADS1115_ADDR
-            ch = parse_int(ch_env, ADS1115_CH) if ch_env else ADS1115_CH
+            default_ch = default_channels.get(name, ADS1115_CH)
+            ch = parse_int(ch_env, default_ch) if ch_env else default_ch
             gain = parse_int(gain_env, ADS1115_GAIN) if gain_env else ADS1115_GAIN
             reader = ADS1115Reader(addr, ch, gain)
             self.flow_readers[name] = reader
             self.flow_samples[name] = []
             self.flow_next_sample[name] = None
             if SAMPLE_PERIOD_SEC is None:
-                period = 1 if reader.sim else 600
+                period = 1 if reader.sim else 10
             else:
                 period = SAMPLE_PERIOD_SEC
             self.flow_sample_period[name] = period
@@ -1640,9 +1699,6 @@ class App(ctk.CTk):
             "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
             "fermentador": fermenter,
             "flow_sccm": f"{flow:.4f}",
-            "rate_g_l_h": f"{flow_to_rate_g_l_h(flow):.6f}",
-            "current_ma": f"{current_ma:.3f}",
-            "voltage_v": f"{voltage:.4f}",
             "status": status,
         }
         ipath = self._co2_csv_path(fermenter)
@@ -1732,7 +1788,6 @@ class App(ctk.CTk):
         stats.grid_columnconfigure(1, weight=1)
 
         flow_var = tk.StringVar(value="0.00 SCCM")
-        rate_var = tk.StringVar(value="0.0000 g/L*h")
         current_var = tk.StringVar(value="0.00 mA")
         voltage_var = tk.StringVar(value="0.000 V")
         status_var = tk.StringVar(value="Esperando...")
@@ -1740,8 +1795,6 @@ class App(ctk.CTk):
 
         ttk.Label(stats, text="Caudal:", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(stats, textvariable=flow_var, font=("Segoe UI", 12)).grid(row=0, column=1, sticky="w")
-        ttk.Label(stats, text="Tasa fermentación:", font=("Segoe UI", 12, "bold")).grid(row=1, column=0, sticky="w")
-        ttk.Label(stats, textvariable=rate_var, font=("Segoe UI", 12)).grid(row=1, column=1, sticky="w")
         ttk.Label(stats, text="Corriente:", font=("Segoe UI", 12, "bold")).grid(row=2, column=0, sticky="w")
         ttk.Label(stats, textvariable=current_var, font=("Segoe UI", 12)).grid(row=2, column=1, sticky="w")
         ttk.Label(stats, text="Voltaje:", font=("Segoe UI", 12, "bold")).grid(row=3, column=0, sticky="w")
@@ -1766,6 +1819,7 @@ class App(ctk.CTk):
             refresh()
 
         for label, hours in [
+            ("Tiempo real", None),
             ("1 h", 1),
             ("12 h", 12),
             ("24 h", 24),
@@ -1773,7 +1827,6 @@ class App(ctk.CTk):
             ("72 h", 72),
             ("1 semana", 24 * 7),
             ("2 semanas", 24 * 14),
-            ("3 semanas", 24 * 21),
         ]:
             ttk.Button(control, text=label, command=lambda h=hours: set_window(h)).pack(side="left", padx=2)
 
@@ -1831,23 +1884,17 @@ class App(ctk.CTk):
         else:
             led.set_color("#ef4444")
 
-        fig, (ax_flow, ax_rate) = plt.subplots(
-            2,
+        fig, ax_flow = plt.subplots(
             1,
-            sharex=True,
+            1,
             figsize=(9, 6),
-            gridspec_kw={"height_ratios": [3, 2], "hspace": 0.2},
         )
         line_flow, = ax_flow.plot([], [], color="#2563eb", linewidth=2, label="Caudal")
-        line_rate, = ax_rate.plot([], [], color="#f97316", linewidth=2, linestyle="--", label="dCO2/dt")
         ax_flow.set_title("Caudal CO2 (SCCM)")
         ax_flow.set_ylabel("SCCM")
         ax_flow.grid(True, alpha=0.2)
-        ax_rate.set_title("Tasa de fermentación (dCO2/dt)")
-        ax_rate.set_ylabel("g/L*h")
-        ax_rate.set_xlabel("Hora")
-        ax_rate.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-        ax_rate.grid(True, alpha=0.2)
+        ax_flow.set_xlabel("Hora")
+        ax_flow.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
 
         canvas = FigureCanvasTkAgg(fig, master=top)
         canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -1869,8 +1916,6 @@ class App(ctk.CTk):
             times = [ts for ts, _, _, _, _ in windowed]
             values = [flow for _, flow, _, _, _ in windowed]
             line_flow.set_data(times, values)
-            rate_values = [flow_to_rate_g_l_h(flow) for flow in values]
-            line_rate.set_data(times, rate_values)
 
             right = times[-1]
             if current_window_hours is None:
@@ -1885,10 +1930,6 @@ class App(ctk.CTk):
             vmax = max(values)
             pad = (vmax - vmin) * 0.1 if vmax != vmin else 1.0
             ax_flow.set_ylim(vmin - pad, vmax + pad)
-            rmin = min(rate_values)
-            rmax = max(rate_values)
-            rpad = (rmax - rmin) * 0.1 if rmax != rmin else 1.0
-            ax_rate.set_ylim(rmin - rpad, rmax + rpad)
             fig.autofmt_xdate()
             canvas.draw_idle()
 
@@ -1896,14 +1937,12 @@ class App(ctk.CTk):
             samples = self.flow_samples.get(fermenter, [])
             if not samples:
                 flow_var.set("0.00 SCCM")
-                rate_var.set("0.0000 g/L*h")
                 current_var.set("0.00 mA")
                 voltage_var.set("0.000 V")
                 status_var.set("Esperando...")
                 return
             _, flow, current_ma, voltage, status = samples[-1]
             flow_var.set(f"{flow:0.2f} SCCM")
-            rate_var.set(f"{flow_to_rate_g_l_h(flow):0.4f} g/L*h")
             current_var.set(f"{current_ma:0.2f} mA")
             voltage_var.set(f"{voltage:0.3f} V")
             status_var.set(status)
@@ -2118,6 +2157,11 @@ class App(ctk.CTk):
         try:
             for f in self.ferms:
                 f.stop_all()
+            for reader in self.flow_readers.values():
+                try:
+                    reader.close()
+                except Exception:
+                    pass
             self.hw.cleanup()
         finally:
             try:
